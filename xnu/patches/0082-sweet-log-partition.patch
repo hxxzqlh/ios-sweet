@@ -1,0 +1,367 @@
+--- a/bsd/dev/sweet_ufs.c	2026-10-22 12:29:45.195251646 +0800
++++ b/bsd/dev/sweet_ufs.c	2026-10-22 12:38:19.696442108 +0800
+@@ -94,15 +94,22 @@
+ #define DMA_BOUNCE      0x4000
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
+ 
++#define SWEET_LOG_SIZE          (4u << 20)
++#define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
++#define SWEET_LOG_SECS          10u
++
+ static struct {
+ 	vm_offset_t regs;
+ 	vm_offset_t dma;                        /* kernel VA of the DMA allocation */
+ 	uint64_t dma_pa;
+ 	uint8_t lun;
++	uint8_t log_lun;                        /* LUN of sweetlogpart (may differ) */
+ 	uint8_t tag;
+-	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
++	uint64_t first_block, nblocks;          /* root partition, in 4 KiB device blocks */
++	uint64_t log_first_block, log_nblocks;  /* console-log partition, 4 KiB blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
++	bool log_ready;                         /* sweetlogpart found and large enough */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
+ 	int bmajor, cmajor;
+@@ -142,7 +149,7 @@
+  * (to the device when write is set). Returns 0 or an errno.
+  */
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_scsi_lun(uint8_t lun, const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+@@ -154,7 +161,7 @@
+ 
+ 	ucd->cmd[0] = 0x01;                     /* COMMAND UPIU */
+ 	ucd->cmd[1] = len ? (write ? 0x20 : 0x40) : 0x00;      /* W: data out, R: data in */
+-	ucd->cmd[2] = su.lun;
++	ucd->cmd[2] = lun;
+ 	ucd->cmd[3] = ++su.tag;
+ 	ucd->cmd[12] = (uint8_t)(len >> 24);
+ 	ucd->cmd[13] = (uint8_t)(len >> 16);
+@@ -252,9 +259,15 @@
+ 	return 0;
+ }
+ 
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	return ufs_scsi_lun(su.lun, cdb, cdb_len, len, write);
++}
++
+ /* READ(10) of count device blocks at lba into the bounce buffer. */
+ static int
+-ufs_read_blocks(uint64_t lba, uint32_t count)
++ufs_read_blocks_lun(uint8_t lun, uint64_t lba, uint32_t count)
+ {
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+@@ -264,7 +277,13 @@
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++	return ufs_scsi_lun(lun, cdb, sizeof(cdb), count * UFS_BLOCK, false);
++}
++
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_read_blocks_lun(su.lun, lba, count);
+ }
+ 
+ /*
+@@ -272,11 +291,12 @@
+  * must lie inside the partition: this is the only place data goes out.
+  */
+ static int
+-ufs_write_blocks(uint64_t lba, uint32_t count)
++ufs_write_blocks_in(uint8_t lun, uint64_t lba, uint32_t count,
++    uint64_t first, uint64_t nblocks)
+ {
+-	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+-	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+-	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
++	if (!su.writable || !nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba < first || lba - first >= nblocks ||
++	    count > nblocks - (lba - first) || lba + count - 1 > UINT32_MAX) {
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
+@@ -285,26 +305,51 @@
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++	return ufs_scsi_lun(lun, cdb, sizeof(cdb), count * UFS_BLOCK, true);
+ }
+ 
+ static int
+-ufs_sync_cache(void)
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_write_blocks_in(su.lun, lba, count, su.first_block, su.nblocks);
++}
++
++static int
++ufs_write_log_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_write_blocks_in(su.log_lun, lba, count,
++	    su.log_first_block, su.log_nblocks);
++}
++
++static int
++ufs_sync_cache_lun(uint8_t lun)
+ {
+ 	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+-	return ufs_scsi(cdb, sizeof(cdb), 0, false);
++	return ufs_scsi_lun(lun, cdb, sizeof(cdb), 0, false);
+ }
+ 
+ static int
+-ufs_find_partition(const char *want)
++ufs_sync_cache(void)
++{
++	return ufs_sync_cache_lun(su.lun);
++}
++
++static int
++ufs_find_partition_on(uint8_t lun, const char *want, uint64_t *first_out,
++    uint64_t *nblocks_out)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+-	int error = ufs_read_blocks(1, 1);
++	static const uint8_t tur[6] = { 0x00 };
++	/* A LUN that the bootloader used may still report unit attention. */
++	for (int i = 0; i < 3; i++) {
++		(void)ufs_scsi_lun(lun, tur, sizeof(tur), 0, false);
++	}
++	int error = ufs_read_blocks_lun(lun, 1, 1);
+ 	if (error) {
+ 		return error;
+ 	}
+ 	if (memcmp(b, "EFI PART", 8) != 0) {
+-		printf("SWEET UFS: LUN %u has no GPT\n", su.lun);
++		printf("SWEET UFS: LUN %u has no GPT\n", lun);
+ 		return ENXIO;
+ 	}
+ 	uint64_t entry_lba;
+@@ -316,7 +361,7 @@
+ 		printf("SWEET UFS: unsupported GPT entries %u x %u\n", nent, esz);
+ 		return ENXIO;
+ 	}
+-	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	error = ufs_read_blocks_lun(lun, entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
+ 	if (error) {
+ 		return error;
+ 	}
+@@ -341,15 +386,21 @@
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		*first_out = first;
++		*nblocks_out = last - first + 1;
+ 		return 0;
+ 	}
+-	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
++	printf("SWEET UFS: no GPT partition named \"%s\" on LUN %u\n", want, lun);
+ 	return ENOENT;
+ }
+ 
+ static int
++ufs_find_partition(const char *want)
++{
++	return ufs_find_partition_on(su.lun, want, &su.first_block, &su.nblocks);
++}
++
++static int
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+@@ -595,6 +646,10 @@
+ 		return ENXIO;
+ 	}
+ 	PE_parse_boot_argn("ufsroot", want, sizeof(want));
++	char logpart[64] = "logfs";
++	PE_parse_boot_argn("sweetlogpart", logpart, sizeof(logpart));
++	uint32_t loglun = 4;
++	PE_parse_boot_argn("sweetloglun", &loglun, sizeof(loglun));
+ 	uint32_t rw = 0;
+ 	PE_parse_boot_argn("ufsrw", &rw, sizeof(rw));
+ 	uint32_t cache = 0, wait = 0;
+@@ -628,6 +683,40 @@
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
++	if (!error && logpart[0]) {
++		uint64_t lf = 0, ln = 0;
++		int lerr = ENOENT;
++		if (loglun < 8) {
++			lerr = ufs_find_partition_on((uint8_t)loglun, logpart, &lf, &ln);
++		}
++		/* A moved/renamed partition should not require a new build: scan. */
++		for (uint8_t l = 0; lerr && l < 8; l++) {
++			if (l == loglun) {
++				continue;
++			}
++			lerr = ufs_find_partition_on(l, logpart, &lf, &ln);
++			if (!lerr) {
++				loglun = l;
++			}
++		}
++		if (!lerr && lf < su.first_block + su.nblocks && su.first_block < lf + ln) {
++			printf("SWEET LOG: refusing log partition overlapping the root partition\n");
++			lerr = EPERM;
++		}
++		if (!lerr && ln >= SWEET_LOG_BLOCKS) {
++			su.log_lun = (uint8_t)loglun;
++			su.log_first_block = lf;
++			su.log_nblocks = ln;
++			su.log_ready = true;
++			printf("SWEET LOG: partition \"%s\" on LUN %u: block 0x%llx, %llu MiB\n",
++			    logpart, loglun, lf, ln * UFS_BLOCK >> 20);
++		} else if (!lerr) {
++			printf("SWEET LOG: \"%s\" is too small (%llu blocks, need %u)\n",
++			    logpart, ln, SWEET_LOG_BLOCKS);
++		} else {
++			printf("SWEET LOG: no writable log partition \"%s\"\n", logpart);
++		}
++	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
+ 		return error;
+@@ -659,18 +748,16 @@
+  * other way to see the console, so every character that reaches the
+  * console (kernel printf and /dev/console writes of daemons, both through
+  * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
+- * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
+- * the partition every ufslogsecs seconds (default 10), far behind the HFS
+- * image at its start. Device block 0 of that area is a header:
++ * and writable a thread copies new ring blocks to the start of a dedicated
++ * GPT partition every ufslogsecs seconds (default 10). The partition is
++ * "logfs" by default; boot-args sweetlogpart=NAME and sweetloglun=N select
++ * another one. Device block 0 of that partition is a header:
+  *   "SWEETLOG" | u32 version 1 | u32 ring size | u64 total bytes written
+  *   | u64 flush sequence
+- * ring offset of byte n = n % ring size. Read it from a recovery with
+- * tools/sweet-log-pull.sh. Disabled with boot-arg sweetlog=0.
++ * ring offset of byte n = n % ring size. Read it with `fastboot fetch` and
++ * tools/fetch-log.sh. Disabled with boot-arg sweetlog=0; never falls back to
++ * the root partition, so a read-only diagnostic boot cannot write userdata.
+  */
+-#define SWEET_LOG_SIZE          (4u << 20)
+-#define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+-#define SWEET_LOG_SECS          10u
+-
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+@@ -700,50 +787,51 @@
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	uint64_t base = su.log_first_block;
+ 	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+-	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+-	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
++	printf("SWEET LOG: console log to log partition LUN %u block 0x%llx (%u KiB)\n",
++	    (unsigned)su.log_lun, base, SWEET_LOG_BLOCKS * UFS_BLOCK >> 10);
+ 	for (;;) {
+-		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+ 		uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
+-		if (total == flushed) {
+-			continue;
+-		}
+-		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : flushed;
+-		int error = 0;
+-
+-		lck_mtx_lock(&sweet_ufs_lock);
+-		while (pos < total && !error) {
+-			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
+-			uint32_t blk = off / UFS_BLOCK;
+-			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
+-			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+-			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+-			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
+-			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+-		}
+-		if (!error) {
+-			struct sweet_log_header h = {
+-				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
+-				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
+-			};
+-			bzero(bounce, UFS_BLOCK);
+-			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
+-		}
+-		if (!error) {
+-			error = ufs_sync_cache();
+-		}
+-		lck_mtx_unlock(&sweet_ufs_lock);
+-		if (error) {
+-			printf("SWEET LOG: write failed (%d), stopping\n", error);
+-			return;
++		if (total != flushed) {
++			uint64_t pos = total - flushed >= SWEET_LOG_SIZE ?
++			    total - SWEET_LOG_SIZE : flushed;
++			int error = 0;
++
++			lck_mtx_lock(&sweet_ufs_lock);
++			while (pos < total && !error) {
++				uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++				uint32_t blk = off / UFS_BLOCK;
++				uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++				uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++				    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++				memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++				error = ufs_write_log_blocks(base + 1 + blk, n);
++				pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++			}
++			if (!error) {
++				struct sweet_log_header h = {
++					.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++					.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
++				};
++				bzero(bounce, UFS_BLOCK);
++				memcpy(bounce, &h, sizeof(h));
++				error = ufs_write_log_blocks(base, 1);
++			}
++			if (!error) {
++				error = ufs_sync_cache_lun(su.log_lun);
++			}
++			lck_mtx_unlock(&sweet_ufs_lock);
++			if (error) {
++				printf("SWEET LOG: write failed (%d), stopping\n", error);
++				return;
++			}
++			flushed = total;
+ 		}
+-		flushed = total;
++		/* First pass flushes immediately; then one write per interval. */
++		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+ 	}
+ }
+ 
+@@ -754,7 +842,12 @@
+ 	thread_t thread;
+ 
+ 	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
+-	if (!on || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++	if (!on) {
++		return;
++	}
++	if (!su.writable || !su.log_ready) {
++		printf("SWEET LOG: disabled (sweetlog=%u, writable=%d, log_ready=%d)\n",
++		    on, su.writable, su.log_ready);
+ 		return;
+ 	}
+ 	PE_parse_boot_argn("ufslogsecs", &sweet_log_secs, sizeof(sweet_log_secs));
