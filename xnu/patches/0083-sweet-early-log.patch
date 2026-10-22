@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -874,6 +874,147 @@
+@@ -874,6 +874,182 @@
  	}
  }
  
@@ -14,6 +14,7 @@
 + */
 +static bool sweet_log_early_done;
 +static bool sweet_log_busy;
++static int sweet_log_last_error;
 +
 +int sweet_log_early_start(void);
 +int sweet_log_flush(void);
@@ -33,23 +34,32 @@
 +		return 0;
 +	}
 +	sweet_log_early_done = true;
++	printf("SWEET LOG: early init: enter (regs=%d ready=%d)\n",
++	    su.regs != 0, su.log_ready);
 +
 +	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
 +	if (!on || su.regs || su.log_ready) {
++		printf("SWEET LOG: early init: skipped (on=%u regs=%d ready=%d)\n",
++		    on, su.regs != 0, su.log_ready);
 +		return 0;
 +	}
 +	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
 +	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
 +	    size < 2 * sizeof(uintptr_t)) {
++		printf("SWEET LOG: early init: no /sweet-ufs node\n");
 +		return ENXIO;
 +	}
 +	su.regs = ml_io_map(reg[0], reg[1]);
++	printf("SWEET LOG: early init: ufs pa 0x%llx size 0x%llx -> va 0x%llx\n",
++	    (uint64_t)reg[0], (uint64_t)reg[1], (uint64_t)su.regs);
 +	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
 +	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET LOG: early init: no contiguous DMA\n");
 +		return ENOMEM;
 +	}
 +	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
 +	if (!pn) {
++		printf("SWEET LOG: early init: no phys for DMA 0x%llx\n", (uint64_t)su.dma);
 +		return ENOMEM;
 +	}
 +	su.dma_pa = ptoa_64(pn);
@@ -62,16 +72,36 @@
 +		return EINVAL;
 +	}
 +
++	printf("SWEET LOG: early init: dma 0x%llx, part \"%s\" lun %u\n",
++	    su.dma_pa, logpart, loglun);
++
 +	lck_mtx_lock(&sweet_ufs_lock);
 +	error = ufs_take_over_host();
++	printf("SWEET LOG: early init: takeover -> %d\n", error);
 +	if (!error) {
 +		static const uint8_t tur[6] = { 0x00 };
 +		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
 +		}
++		printf("SWEET LOG: early init: tur -> %d\n", error);
 +	}
 +	if (!error) {
 +		uint64_t lf = 0, ln = 0;
-+		error = ufs_find_partition_on((uint8_t)loglun, logpart, &lf, &ln);
++		int lerr = ENOENT;
++		if (loglun < 8) {
++			lerr = ufs_find_partition_on((uint8_t)loglun, logpart, &lf, &ln);
++		}
++		for (uint8_t l = 0; lerr && l < 8; l++) {
++			if (l == loglun) {
++				continue;
++			}
++			lerr = ufs_find_partition_on(l, logpart, &lf, &ln);
++			if (!lerr) {
++				loglun = l;
++			}
++		}
++		printf("SWEET LOG: early init: gpt \"%s\" -> %d (lun %u, block 0x%llx, %llu)\n",
++		    logpart, lerr, loglun, lf, ln);
++		error = lerr;
 +		if (!error && ln >= SWEET_LOG_BLOCKS) {
 +			su.log_lun = (uint8_t)loglun;
 +			su.log_first_block = lf;
@@ -88,9 +118,11 @@
 +		printf("SWEET LOG: early init failed (%d)\n", error);
 +		return error ? error : ENXIO;
 +	}
-+	printf("SWEET LOG: early log on LUN %u block 0x%llx\n",
++	printf("SWEET LOG: early log on LUN %u block 0x%llx, first flush...\n",
 +	    (unsigned)su.log_lun, su.log_first_block);
-+	(void)sweet_log_flush();
++	int ferr = sweet_log_flush();
++	printf("SWEET LOG: early first flush -> %d, %llu bytes in ring\n",
++	    ferr, os_atomic_load(&sweet_log_total, relaxed));
 +	return 0;
 +}
 +
@@ -139,6 +171,9 @@
 +		lck_mtx_unlock(&sweet_ufs_lock);
 +		if (!error) {
 +			flushed = total;
++		} else if (error != sweet_log_last_error) {
++			sweet_log_last_error = error;
++			printf("SWEET LOG: flush error %d (total %llu)\n", error, total);
 +		}
 +	}
 +	sweet_log_busy = false;
@@ -150,7 +185,7 @@
  {
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
-@@ -399,16 +399,40 @@
+@@ -399,16 +399,41 @@
  
  	assert(startup_phase < upto);
  
@@ -163,6 +198,7 @@
 +	extern int sweet_log_early_start(void);
 +	extern int sweet_log_flush(void);
 +	if (upto >= STARTUP_SUB_EARLY_BOOT) {
++		kprintf("SWEET: early log hook at phase %d\n", (int)upto);
 +		(void)sweet_log_early_start();
 +	}
 +#endif
