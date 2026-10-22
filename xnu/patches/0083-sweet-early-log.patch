@@ -1,6 +1,37 @@
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -874,6 +874,182 @@
+@@ -296,9 +296,11 @@
+  */
+ static int
+ ufs_write_blocks_in(uint8_t lun, uint64_t lba, uint32_t count,
+-    uint64_t first, uint64_t nblocks)
++    uint64_t first, uint64_t nblocks, bool log_ok)
+ {
+-	if (!su.writable || !nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	/* log_ok: the console-log partition is written even in a read-only
++	 * diagnostic boot (ufsrw=0); the range check below still applies. */
++	if ((!su.writable && !log_ok) || !nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < first || lba - first >= nblocks ||
+ 	    count > nblocks - (lba - first) || lba + count - 1 > UINT32_MAX) {
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+@@ -315,14 +317,14 @@
+ static int
+ ufs_write_blocks(uint64_t lba, uint32_t count)
+ {
+-	return ufs_write_blocks_in(su.lun, lba, count, su.first_block, su.nblocks);
++	return ufs_write_blocks_in(su.lun, lba, count, su.first_block, su.nblocks, false);
+ }
+ 
+ static int
+ ufs_write_log_blocks(uint64_t lba, uint32_t count)
+ {
+ 	return ufs_write_blocks_in(su.log_lun, lba, count,
+-	    su.log_first_block, su.log_nblocks);
++	    su.log_first_block, su.log_nblocks, true);
+ }
+ 
+ static int
+@@ -874,6 +876,188 @@
  	}
  }
  
@@ -78,6 +109,12 @@
 +	lck_mtx_lock(&sweet_ufs_lock);
 +	error = ufs_take_over_host();
 +	printf("SWEET LOG: early init: takeover -> %d\n", error);
++	if (error == EBUSY) {
++		/* ABL (or the shim) left a doorbell set: clear and retry. */
++		ufs_wr(REG_UTRLCLR, ~1u);
++		error = ufs_take_over_host();
++		printf("SWEET LOG: early init: takeover retry -> %d\n", error);
++	}
 +	if (!error) {
 +		static const uint8_t tur[6] = { 0x00 };
 +		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
