@@ -1,0 +1,248 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -874,6 +874,147 @@
+ 	}
+ }
+ 
++/*
++ * Early log mode. The kernel can stop long before root is mounted, and then
++ * the ring above never reaches the partition. These two entry points are
++ * called from osfmk/kern/startup.c around each EARLY_BOOT initialiser, long
++ * before BSD init: they bring the polled UFS path up on their own (no
++ * bdevsw, no devfs, no thread) and push the ring out synchronously, so the
++ * last text written before a hang or a reset is on the partition.
++ */
++static bool sweet_log_early_done;
++static bool sweet_log_busy;
++
++int sweet_log_early_start(void);
++int sweet_log_flush(void);
++
++int
++sweet_log_early_start(void)
++{
++	uint32_t on = 1;
++	char logpart[64] = "logfs";
++	uint32_t loglun = 4;
++	DTEntry node;
++	uintptr_t const *reg = NULL;
++	unsigned int size = 0;
++	int error = 0;
++
++	if (sweet_log_early_done) {
++		return 0;
++	}
++	sweet_log_early_done = true;
++
++	PE_parse_boot_argn("sweetlog", &on, sizeof(on));
++	if (!on || su.regs || su.log_ready) {
++		return 0;
++	}
++	if (SecureDTLookupEntry(NULL, "/sweet-ufs", &node) != kSuccess ||
++	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
++	    size < 2 * sizeof(uintptr_t)) {
++		return ENXIO;
++	}
++	su.regs = ml_io_map(reg[0], reg[1]);
++	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return ENOMEM;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)su.dma);
++	if (!pn) {
++		return ENOMEM;
++	}
++	su.dma_pa = ptoa_64(pn);
++	su.lun = 0;
++	su.secsize = DEV_BSIZE;
++
++	PE_parse_boot_argn("sweetlogpart", logpart, sizeof(logpart));
++	PE_parse_boot_argn("sweetloglun", &loglun, sizeof(loglun));
++	if (!logpart[0] || loglun >= 8) {
++		return EINVAL;
++	}
++
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_take_over_host();
++	if (!error) {
++		static const uint8_t tur[6] = { 0x00 };
++		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
++		}
++	}
++	if (!error) {
++		uint64_t lf = 0, ln = 0;
++		error = ufs_find_partition_on((uint8_t)loglun, logpart, &lf, &ln);
++		if (!error && ln >= SWEET_LOG_BLOCKS) {
++			su.log_lun = (uint8_t)loglun;
++			su.log_first_block = lf;
++			su.log_nblocks = ln;
++			su.log_ready = true;
++		} else if (!error) {
++			printf("SWEET LOG: early \"%s\" is too small (%llu blocks)\n",
++			    logpart, ln);
++			error = ENOSPC;
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error || !su.log_ready) {
++		printf("SWEET LOG: early init failed (%d)\n", error);
++		return error ? error : ENXIO;
++	}
++	printf("SWEET LOG: early log on LUN %u block 0x%llx\n",
++	    (unsigned)su.log_lun, su.log_first_block);
++	(void)sweet_log_flush();
++	return 0;
++}
++
++/* One synchronous pass of the thread loop above. Safe before BSD init. */
++int
++sweet_log_flush(void)
++{
++	static uint64_t flushed, seq;
++	uint64_t base = su.log_first_block;
++	void *bounce;
++	int error = 0;
++
++	if (!su.log_ready || sweet_log_busy) {
++		return 0;
++	}
++	sweet_log_busy = true;
++	bounce = (void *)(su.dma + DMA_BOUNCE);
++	uint64_t total = os_atomic_load(&sweet_log_total, relaxed);
++	if (total != flushed) {
++		uint64_t pos = total - flushed >= SWEET_LOG_SIZE ?
++		    total - SWEET_LOG_SIZE : flushed;
++
++		lck_mtx_lock(&sweet_ufs_lock);
++		while (pos < total && !error) {
++			uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++			uint32_t blk = off / UFS_BLOCK;
++			uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++			error = ufs_write_log_blocks(base + 1 + blk, n);
++			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++		}
++		if (!error) {
++			struct sweet_log_header h = {
++				.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++				.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = ++seq,
++			};
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &h, sizeof(h));
++			error = ufs_write_log_blocks(base, 1);
++		}
++		if (!error) {
++			error = ufs_sync_cache_lun(su.log_lun);
++		}
++		lck_mtx_unlock(&sweet_ufs_lock);
++		if (!error) {
++			flushed = total;
++		}
++	}
++	sweet_log_busy = false;
++	return error;
++}
++
+ static void
+ sweet_log_start(void)
+ {
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -399,16 +399,40 @@
+ 
+ 	assert(startup_phase < upto);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * SWEET: root is mounted long after these initialisers, so if one of
++	 * them hangs the ring never reaches the log partition. Bring the polled
++	 * UFS log path up here and flush around every EARLY_BOOT entry.
++	 */
++	extern int sweet_log_early_start(void);
++	extern int sweet_log_flush(void);
++	if (upto >= STARTUP_SUB_EARLY_BOOT) {
++		(void)sweet_log_early_start();
++	}
++#endif
++
+ 	while (cur < startup_entries_end && cur->subsystem <= upto) {
++		startup_subsystem_id_t sub = cur->subsystem;
++
+ 		if ((startup_debug & STARTUP_DEBUG_VERBOSE) &&
++		    (!(startup_debug & STARTUP_DEBUG_EARLY_ONLY) ||
++		    sub >= STARTUP_SUB_EARLY_BOOT) &&
+ 		    startup_phase >= STARTUP_SUB_KPRINTF) {
+ 			kprintf("%s[%d, rank %d]: %p(%p)\n", __func__,
+ 			    cur->subsystem, cur->rank, cur->func, cur->arg);
+ 		}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* Persist "about to run X": if X hangs, the log ends with it. */
++		(void)sweet_log_flush();
++#endif
+ 		startup_phase = cur->subsystem - 1;
+ 		kernel_startup_log(cur->subsystem);
+ 		cur->func(cur->arg);
+ 		startup_entry_cur = ++cur;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		(void)sweet_log_flush();
++#endif
+ 	}
+ 	kernel_startup_log(upto);
+ 
+--- a/osfmk/kern/startup.h
++++ b/osfmk/kern/startup.h
+@@ -93,6 +93,8 @@
+ __options_decl(startup_debug_t, uint32_t, {
+ 	STARTUP_DEBUG_NONE    = 0x00000000,
+ 	STARTUP_DEBUG_VERBOSE = 0x00000001,
++	/* SWEET: only print the EARLY_BOOT initialisers (keeps the screen short) */
++	STARTUP_DEBUG_EARLY_ONLY = 0x00000002,
+ });
+ 
+ extern startup_debug_t startup_debug;
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -501,6 +501,13 @@
+ 	throttle_init();
+ 
+ 	printf(copyright);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/* Persist the console ring so a hang below is still visible. */
++		extern int sweet_log_flush(void);
++		(void)sweet_log_flush();
++	}
++#endif
+ 
+ #if CONFIG_DEV_KMEM
+ 	bsd_init_kprintf("calling dev_kmem_init\n");
+@@ -690,6 +697,13 @@
+ 	/* Initialize the file systems. */
+ 	bsd_init_kprintf("calling vfsinit\n");
+ 	vfsinit();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		extern int sweet_log_flush(void);
++		printf("SWEET: vfsinit done\n");
++		(void)sweet_log_flush();
++	}
++#endif
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
+@@ -878,6 +892,13 @@
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		{
++			extern int sweet_log_flush(void);
++			printf("SWEET: mounting root (rd=%s)\n", rootdevice);
++			(void)sweet_log_flush();
++		}
++#endif
+ 		bsd_init_kprintf("vfs_mountroot\n");
+ 		if (0 == (err = vfs_mountroot())) {
+ 			break;
